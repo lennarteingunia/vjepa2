@@ -1,0 +1,36 @@
+model: 
+  backbone:
+    model_name: vjepa2_vit_large
+  classifier:
+    num_heads: 16
+    depth: 4
+data:
+  csv_sep: " "
+  img_size: 224
+  num_classes: 100
+  train:
+    csv_paths: 
+      - /mnt/datasets/wlasl/wlasl/metadata/train100vjepa.csv
+    frames_per_clip: 16
+    frame_step: 4
+    stride: 8
+    pad_start: False
+    pad_end: True
+  val:
+    csv_paths: 
+      - /mnt/datasets/wlasl/wlasl/metadata/val100vjepa.csv
+    frames_per_clip: 16
+    frame_step: 4
+    stride: 8
+    pad_start: False
+    pad_end: True
+optimization:
+  epochs: 20
+  batch_size: 4
+  multihead_kwargs:
+  - final_lr: 0.0
+    final_weight_decay: 0.01
+    lr: 0.005
+    start_lr: 0.005
+    warmup: 0.0
+    weight_decay: 0.01
