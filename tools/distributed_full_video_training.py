@@ -1,15 +1,20 @@
 from __future__ import annotations
+from abc import ABC, abstractmethod
 import datetime
 import logging
+import math
 import os
 import time
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 import warnings
 
+from overrides import override
 import torch
 import tensorboardX
 import torch.multiprocessing.spawn
 import torch.utils.data.distributed
+import torchmetrics
+import torchmetrics.classification
 import tqdm
 from models.attentive_pooler import AttentiveClassifier
 from src.datasets.full_video_dataset import CSVFullVideoClassifcationDataset
@@ -41,6 +46,102 @@ class TransformDataset(CSVFullVideoClassifcationDataset):
         sample = super().__getitem__(index)
         sample["data"] = self._clip_transforms(sample["data"])
         return sample
+
+
+class _Scheduler(ABC):
+
+    def __init__(
+        self: _Scheduler,
+        optimizer: torch.optim.Optimizer,
+    ) -> None:
+        self.optimizer = optimizer
+        self._reset()
+
+    @property
+    def global_step(self: _Scheduler) -> int:
+        return self._step
+
+    @property
+    def optimizer(self: _Scheduler) -> torch.optim.Optimizer:
+        return self._optimizer
+
+    @optimizer.setter
+    def optimizer(self: _Scheduler, optimizer: torch.optim.Optimizer) -> None:
+        self._optimizer = optimizer
+
+    def _reset(self: _Scheduler) -> None:
+        self._step = 0
+
+    @abstractmethod
+    def step(self: _Scheduler) -> None:
+        raise NotImplementedError(f"Method {_Scheduler.step.__name__} has not been implemented.")
+
+
+class WarmUpCosineSchedule(_Scheduler):
+
+    def __init__(
+        self: WarmUpCosineSchedule,
+        optimizer: torch.optim.Optimizer,
+        T_max: int,
+        *,
+        mode: Literal["lr", "weight_decay"] = "lr",
+    ) -> None:
+        super(WarmUpCosineSchedule, self).__init__(optimizer=optimizer)
+
+        self.T_max = T_max
+        self.mode = mode
+
+    @override
+    def step(self: WarmUpCosineSchedule) -> None:
+        self._step += 1
+        for group in self.optimizer.param_groups:
+            ref_value = group[f"mc_ref_{self.mode}"]
+            final_value = group[f"mc_final_{self.mode}"]
+            start_value = group[f"mc_start_{self.mode}"]
+            warmup_steps = group[f"mc_warmup_steps_{self.mode}"]
+            T_max = self.T_max - warmup_steps
+            if self._step < warmup_steps:
+                progress = float(self._step) / float(max(1, T_max))
+                new_value = start_value + progress * (ref_value - start_value)
+            else:
+                progress = float(self._step - warmup_steps) / float(max(1, T_max))
+                new_value = max(final_value, final_value + (ref_value - final_value)
+                                * 0.5 * (1.0 + math.cos(math.pi * progress)))
+            group[self.mode] = new_value
+
+
+class CosineSchedule(_Scheduler):
+
+    def __init__(
+        self: CosineSchedule,
+        optimizer: torch.optim.Optimizer,
+        T_max: int,
+        *,
+        mode: Literal["lr", "weight_decay"] = "weight_decay"
+    ) -> None:
+        super(CosineSchedule, self).__init__(optimizer=optimizer)
+        self.T_max = T_max
+        self.mode = mode
+
+    def step(self: CosineSchedule) -> None:
+
+        self._step += 1
+        progress = self._step / self.T_max
+
+        for group in self.optimizer.param_groups:
+
+            ref_value = group[f"mc_ref_{self.mode}"]
+            final_value = group[f"mc_final_{self.mode}"]
+
+            new_value = final_value + (ref_value - final_value) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+            if final_value <= ref_value:
+                new_value = max(final_value, new_value)
+
+            else:
+                new_value = min(final_value, new_value)
+
+            group[self.mode] = new_value
 
 
 IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
@@ -249,18 +350,6 @@ def _train(
         ) for _ in optimization.get("multihead_kwargs", _default_multihead_kwargs())
     ]
 
-    # -- OPTIMIZATION CONFIGURATION --
-
-    # TODO: Make weight decay work.
-
-    optimizers = [
-        torch.optim.AdamW(
-            params=classifier.parameters(),
-            lr=optim_params["lr"],
-            weight_decay=optim_params["weight_decay"]
-        ) for classifier, optim_params in zip(classifiers, optimization.get("multihead_kwargs", _default_multihead_kwargs()))
-    ]
-
     # -- DATA CONFIGURATION --
     train_config = data.get("train", _default_train_data_config())
 
@@ -321,7 +410,69 @@ def _train(
         persistent_workers=True,
     )
 
+    # -- OPTIMIZATION CONFIGURATION --
+
+    optimizers, lr_schedulers, wd_schedulers, grad_scalers = [], [], [], []
+    for classifier, optim_params in zip(classifiers, optimization.get("multihead_kwargs", _default_multihead_kwargs())):
+        param_groups = [
+            {
+                "params": (p for _, p in classifier.named_parameters()),
+                # TODO: Iterations per epoch?
+                "mc_warmup_steps_lr": int(optim_params.get("warmup") * len(train_dataloader)),
+                "mc_start_lr": optim_params.get("start_lr"),
+                "mc_ref_lr": optim_params.get("lr"),
+                "mc_final_lr": optim_params.get("final_lr"),
+                "mc_ref_weight_decay": optim_params.get("weight_decay"),
+                "mc_final_weight_decay": optim_params.get("final_weight_decay")
+            }
+        ]
+
+        optimizer = torch.optim.AdamW(params=param_groups)
+        lr_scheduler = WarmUpCosineSchedule(
+            optimizer=optimizer,
+            T_max=int(len(train_dataloader) * optimization.get("epochs", 20)),
+            mode="lr",
+        )
+        wd_scheduler = CosineSchedule(
+            optimizer=optimizer,
+            T_max=int(len(train_dataloader) * optimization.get("epochs", 20)),
+            mode="weight_decay"
+        )
+        grad_scaler = torch.amp.grad_scaler.GradScaler()
+        optimizers.append(optimizer)
+        lr_schedulers.append(lr_scheduler)
+        wd_schedulers.append(wd_scheduler)
+        grad_scalers.append(grad_scaler)
+
+    validation_metrics = dict(
+        accuracy=torchmetrics.classification.MulticlassAccuracy(
+            num_classes=data.get("num_classes", 100)
+        ),
+        auroc=torchmetrics.classification.MulticlassAUROC(
+            num_classes=data.get("num_classes", 100),
+            thresholds=[0.5, 0.6, 0.7, 0.8, 0.9],
+        ),
+        cm=torchmetrics.classification.MulticlassConfusionMatrix(
+            num_classes=data.get("num_classes", 100),
+        )
+    )
+
+    validation_metrics = {name: metric.to(rank) for name, metric in validation_metrics.items()}
+
+    def _val_epoch_fn(epoch: int): return _val_epoch(
+        rank=rank,
+        world_size=world_size,
+        data_loader=val_dataloader,
+        encoder=encoder,
+        classifiers=classifiers,  # type: ignore
+        metrics=validation_metrics,
+        tensorboard_logger=tensorboard_logger,
+        logger=logger,
+        epoch=epoch
+    )
+
     for epoch in range(optimization.get("epochs", 20)):
+        _val_epoch_fn(epoch=epoch)
         logger.info(f"Running training epoch {epoch} on rank {rank}.")
         _train_epoch(
             rank=rank,
@@ -330,12 +481,62 @@ def _train(
             encoder=encoder,
             classifiers=classifiers,  # type: ignore
             optimizers=optimizers,
+            schedulers=lr_schedulers + wd_schedulers,
+            grad_scalers=grad_scalers,
             tensorboard_logger=tensorboard_logger,
             logger=logger,
+            epoch=epoch,
         )
+    _val_epoch_fn(epoch=optimization.get("epochs", 20) - 1)
 
     logger.info(f"Cleaning up distributed environment for rank {rank}.")
     cleanup(rank, logger=logger)
+
+
+@torch.no_grad()
+def _val_epoch(
+    rank: int,
+    world_size: int,
+    data_loader: torch.utils.data.DataLoader,
+    encoder: torch.nn.Module,
+    classifiers: list[torch.nn.Module],
+    metrics: dict[str, torchmetrics.Metric] = dict(),
+    *,
+    tensorboard_logger: Optional[tensorboardX.SummaryWriter] = None,
+    logger: Optional[logging.Logger] = None,
+    epoch: int = 0,
+) -> None:
+
+    if logger is None:
+        logger = _get_logger(rank=rank)
+
+    logger.info(f"Making new validation iterable on rank {rank}.")
+    data_iter = iter(data_loader)
+    pbar = tqdm.tqdm(enumerate(data_iter), total=len(data_loader))
+
+    logger.info(f"Resetting validation metrics on epoch {epoch}.")
+    for metric in metrics.values():
+        metric.reset()
+
+    per_classifier_metrics = [{name: metric.clone() for name, metric in metrics.items()} for _ in classifiers]
+
+    for idx, batch in pbar:
+
+        data = batch["data"].to(rank)
+        label = batch["label"].to(rank)
+
+        features = encoder(data)
+        outputs = [classifier(features) for classifier in classifiers]
+
+        for metrics, output in zip(per_classifier_metrics, outputs):
+            for metric in metrics.values():
+                metric.update(output, label)
+
+    if not tensorboard_logger is None:
+
+        for idx, metrics in enumerate(per_classifier_metrics):
+            for metric_name, metric in metrics.items():
+                tensorboard_logger.add_scalar(f"val/{idx}/{metric_name}", metric.compute().item(), global_step=epoch)
 
 
 def _train_epoch(
@@ -344,10 +545,13 @@ def _train_epoch(
     dataloader: torch.utils.data.DataLoader,
     encoder: torch.nn.Module,
     classifiers: list[torch.nn.Module],
-    optimizers: list,
+    optimizers: list[torch.optim.Optimizer],
+    schedulers: list[_Scheduler],
+    grad_scalers: list[torch.amp.grad_scaler.GradScaler],
     *,
-    tensorboard_logger: Optional[tensorboardX.SummaryWriter],
+    tensorboard_logger: Optional[tensorboardX.SummaryWriter] = None,
     logger: Optional[logging.Logger] = None,
+    epoch: int = 0,
 ) -> None:
 
     if logger is None:
@@ -362,6 +566,12 @@ def _train_epoch(
     logger.info(f"Starting new training loop on rank {rank}.")
     for idx, batch in pbar:
 
+        for optimizer in optimizers:
+            optimizer.zero_grad()
+
+        for scheduler in schedulers:
+            scheduler.step()
+
         data = batch["data"].to(rank)
         label = batch["label"].to(rank)
 
@@ -370,15 +580,16 @@ def _train_epoch(
             outputs = [classifier(features) for classifier in classifiers]
             losses = [loss_fn(output, label) for output in outputs]
 
-        for loss, optimizer in zip(losses, optimizers):
-            loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
+        for loss, optimizer, scaler in zip(losses, optimizers, grad_scalers):
+            scaler.scale(loss).backward()
+            scaler.step(optimizer=optimizer)
+            scaler.update()
 
         if not tensorboard_logger is None:
 
             for loss in losses:
-                tensorboard_logger.add_scalar("train/loss", scalar_value=loss.item(), global_step=idx)
+                tensorboard_logger.add_scalar("train/loss", scalar_value=loss.item(),
+                                              global_step=idx + len(dataloader) * epoch)
 
 
 def main(
